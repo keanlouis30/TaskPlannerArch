@@ -24,11 +24,13 @@ Keybindings:
 
 import json
 import os
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Optional, List, Dict, Any
 import requests
 from dateutil import parser as date_parser
+from zoneinfo import ZoneInfo
+import webbrowser
 
 from textual.app import App, ComposeResult
 from textual.containers import Container, Vertical, Horizontal
@@ -120,6 +122,28 @@ class CanvasAPI:
             return []
         except Exception as e:
             print(f"Failed to fetch planner notes: {e}")
+            return []
+    
+    def get_calendar_events(self, start_date: datetime, end_date: datetime) -> List[Dict[str, Any]]:
+        """Fetch user's calendar events between two dates"""
+        params = {
+            'type': 'event',
+            'start_date': start_date.date().isoformat(),
+            'end_date': end_date.date().isoformat(),
+            'per_page': 50,
+        }
+        try:
+            response = requests.get(
+                f'{self.base_url}/api/v1/calendar_events',
+                headers=self.headers,
+                params=params,
+                timeout=10,
+            )
+            if response.status_code == 200:
+                return response.json()
+            return []
+        except Exception as e:
+            print(f"Failed to fetch calendar events: {e}")
             return []
     
     def create_planner_note(self, title: str, details: str, 
@@ -371,6 +395,7 @@ class CanvasTUI(App):
     BINDINGS = [
         Binding("a", "add_task", "Add Task"),
         Binding("r", "refresh", "Refresh"),
+        Binding("enter", "open_task", "Open Task"),
         Binding("q", "quit", "Quit"),
     ]
     
@@ -412,7 +437,7 @@ class CanvasTUI(App):
         
         # Setup table
         table = self.query_one("#tasks_table", DataTable)
-        table.add_columns("Due", "Course", "Title", "Type")
+        table.add_columns("Due", "Status", "Course", "Title", "Type")
         table.cursor_type = "row"
         
         # Load initial data
@@ -424,9 +449,20 @@ class CanvasTUI(App):
         
         # Fetch courses
         self.courses = self.canvas.get_active_courses()
+
+        # Normalize and filter tasks
+        self.tasks = []
+        now = datetime.now()
+        cutoff = now - timedelta(days=30)
+        future = now + timedelta(days=30)
+        # Current time in Manila (naive)
+        now_manila = datetime.now(ZoneInfo('Asia/Manila')).replace(tzinfo=None)
         
         # Fetch planner notes
         planner_notes = self.canvas.get_planner_notes()
+
+        # Fetch calendar events in same window
+        calendar_events = self.canvas.get_calendar_events(cutoff, future)
         
         # Fetch assignments from all courses
         all_assignments = []
@@ -436,40 +472,139 @@ class CanvasTUI(App):
                 assignment['course_name'] = course['name']
             all_assignments.extend(assignments)
         
-        # Normalize and filter tasks
-        self.tasks = []
-        now = datetime.now()
-        cutoff = now - timedelta(days=30)
-        future = now + timedelta(days=30)
-        
-        # Add planner notes
+        # Add planner notes (only active and future)
         for note in planner_notes:
+            # Skip resolved / inactive notes
+            if note.get('workflow_state') not in (None, 'active'):
+                continue
+
             if note.get('todo_date'):
                 try:
+                    # Build URL for planner note if possible
+                    note_url = None
+                    if note.get('course_id'):
+                        note_url = f"{self.canvas.base_url}/courses/{note['course_id']}/planner_items?filter=planner_note_{note['id']}"
                     due = date_parser.isoparse(note['todo_date'])
-                    if cutoff <= due <= future:
+                    # Convert to Manila time
+                    if due.tzinfo is not None:
+                        due = due.astimezone(ZoneInfo('Asia/Manila'))
+                    else:
+                        due = due.replace(tzinfo=timezone.utc).astimezone(ZoneInfo('Asia/Manila'))
+                    # Make naive for comparison and storage
+                    due_naive = due.replace(tzinfo=None)
+                    cutoff_manila = (
+                        cutoff.replace(tzinfo=timezone.utc)
+                        .astimezone(ZoneInfo("Asia/Manila"))
+                        .replace(tzinfo=None)
+                    )
+                    future_manila = (
+                        future.replace(tzinfo=timezone.utc)
+                        .astimezone(ZoneInfo("Asia/Manila"))
+                        .replace(tzinfo=None)
+                    )
+
+                    # Filter out past tasks: require due >= now (Manila)
+                    if now_manila <= due_naive <= future_manila:
                         self.tasks.append({
                             'title': note['title'],
-                            'due_date': due,
-                            'course': note.get('course_id', 'Personal'),
-                            'type': 'Planner Note'
+                            'due_date': due_naive,
+'course': note.get('course_id', 'Personal'),
+                            'type': 'Planner Note',
+                            'url': note_url,
+                            'raw': note,
                         })
-                except:
+                except Exception:
                     pass
         
-        # Add assignments
+        # Add calendar events
+        for event in calendar_events:
+            try:
+                event_url = event.get('html_url')
+                if event.get('start_at'):
+                    due = date_parser.isoparse(event['start_at'])
+                elif event.get('all_day_date'):
+                    # all-day events use a date string
+                    due = date_parser.isoparse(event['all_day_date'])
+                else:
+                    continue
+
+                # Convert to Manila time
+                if due.tzinfo is not None:
+                    due = due.astimezone(ZoneInfo('Asia/Manila'))
+                else:
+                    due = due.replace(tzinfo=timezone.utc).astimezone(ZoneInfo('Asia/Manila'))
+                # Make naive for comparison and storage
+                due_naive = due.replace(tzinfo=None)
+                cutoff_manila = cutoff.replace(tzinfo=timezone.utc).astimezone(ZoneInfo('Asia/Manila')).replace(tzinfo=None)
+                future_manila = future.replace(tzinfo=timezone.utc).astimezone(ZoneInfo('Asia/Manila')).replace(tzinfo=None)
+
+                # Filter out past events
+                if now_manila <= due_naive <= future_manila:
+                    # Prefer context name if available, else use context code or "Calendar"
+                    context = event.get('context_name') or event.get('context_code', 'Calendar')
+                    self.tasks.append({
+                        'title': event.get('title', 'Untitled Event'),
+                        'due_date': due_naive,
+'course': context,
+                        'type': 'Calendar Event',
+                        'url': event_url,
+                        'raw': event,
+                    })
+            except Exception:
+                pass
+
+            # Add assignments (skip submitted / graded, only future)
         for assignment in all_assignments:
-            if assignment.get('due_at'):
+            # Skip completed assignments
+            submission = assignment.get("submission") or {}
+            if assignment.get("has_submitted_submissions") or submission.get(
+                "workflow_state"
+            ) in {"submitted", "graded", "complete"}:
+                continue
+
+            if assignment.get("due_at"):
                 try:
-                    due = date_parser.isoparse(assignment['due_at'])
-                    if cutoff <= due <= future:
-                        self.tasks.append({
-                            'title': assignment['name'],
-                            'due_date': due,
-                            'course': assignment.get('course_name', 'Unknown'),
-                            'type': 'Assignment'
-                        })
-                except:
+                    # Assignment URL
+                    assignment_url = (
+                        f"{self.canvas.base_url}/courses/{assignment['course_id']}"
+                        f"/assignments/{assignment['id']}"
+                        if assignment.get("course_id") and assignment.get("id")
+                        else None
+                    )
+                    due = date_parser.isoparse(assignment["due_at"])
+                    # Convert to Manila time
+                    if due.tzinfo is not None:
+                        due = due.astimezone(ZoneInfo("Asia/Manila"))
+                    else:
+                        due = due.replace(tzinfo=timezone.utc).astimezone(
+                            ZoneInfo("Asia/Manila")
+                        )
+                    # Make naive for comparison and storage
+                    due_naive = due.replace(tzinfo=None)
+                    cutoff_manila = (
+                        cutoff.replace(tzinfo=timezone.utc)
+                        .astimezone(ZoneInfo("Asia/Manila"))
+                        .replace(tzinfo=None)
+                    )
+                    future_manila = (
+                        future.replace(tzinfo=timezone.utc)
+                        .astimezone(ZoneInfo("Asia/Manila"))
+                        .replace(tzinfo=None)
+                    )
+
+                    # Only future (or today) assignments
+                    if now_manila <= due_naive <= future_manila:
+                        self.tasks.append(
+                            {
+                                "title": assignment["name"],
+                                "due_date": due_naive,
+                                "course": assignment.get("course_name", "Unknown"),
+                                "type": "Assignment",
+                                "url": assignment_url,
+                                "raw": assignment,
+                            }
+                        )
+                except Exception:
                     pass
         
         # Sort by due date
@@ -479,12 +614,19 @@ class CanvasTUI(App):
         table = self.query_one("#tasks_table", DataTable)
         table.clear()
         
-        for task in self.tasks:
-            due_str = task['due_date'].strftime("%m/%d %H:%M")
-            course_str = str(task['course'])[:20]
-            title_str = task['title'][:50]
+        for idx, task in enumerate(self.tasks):
+            due_str = task["due_date"].strftime("%m/%d %H:%M")
+            # Simple status indicator based on Manila date
+            if task["due_date"].date() == now_manila.date():
+                status = "Today"
+            else:
+                status = "Upcoming"
+
+            course_str = str(task["course"])[:20]
+            title_str = task["title"][:50]
             
-            table.add_row(due_str, course_str, title_str, task['type'])
+            # Store the index as the row key so we can map back to tasks
+            table.add_row(due_str, status, course_str, title_str, task["type"], key=idx)
         
         self.query_one("#status_bar", Static).update(
             f"📚 {len(self.tasks)} tasks loaded | Press 'a' to add, 'r' to refresh, 'q' to quit"
@@ -506,6 +648,35 @@ class CanvasTUI(App):
                 self.create_canvas_task(result)
         
         self.push_screen(AddTaskScreen(self.courses), handle_result)
+
+    def action_open_task(self):
+        """Open the selected task in the browser, if it has a URL"""
+        table = self.query_one("#tasks_table", DataTable)
+        if table.cursor_row is None:
+            self.notify("No task selected", severity="warning")
+            return
+
+        row_key = table.row_key(table.cursor_row)
+        if row_key is None:
+            self.notify("Unable to determine selected task", severity="error")
+            return
+
+        try:
+            task = self.tasks[row_key]
+        except (IndexError, TypeError):
+            self.notify("Selected task not found", severity="error")
+            return
+
+        url = task.get('url')
+        if not url:
+            self.notify("No URL available for this task", severity="warning")
+            return
+
+        try:
+            webbrowser.open(url)
+            self.notify("Opened task in browser", severity="information")
+        except Exception as e:
+            self.notify(f"Failed to open browser: {e}", severity="error")
     
     def create_canvas_task(self, task_data: Dict[str, Any]):
         """Create task in Canvas using API"""
